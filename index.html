@@ -4415,6 +4415,7 @@
 
   function onBallPointerUp(e){
     if (!ballDragState || e.pointerId !== ballDragState.pointerId) return;
+    let moved = false;
     if (ballDragState.lastX !== undefined) {
       ball.x = ballDragState.lastX;
       ball.y = ballDragState.lastY;
@@ -4424,12 +4425,14 @@
         ball.offsetX = ball.x - carrier.x;
         ball.offsetY = ball.y - carrier.y;
       }
+      moved = true;
     }
     ballDragState.el.classList.remove('dragging');
     ballDragState.el.removeEventListener('pointermove', onBallPointerMove);
     ballDragState.el.removeEventListener('pointerup', onBallPointerUp);
     ballDragState.el.removeEventListener('pointercancel', onBallPointerUp);
     ballDragState = null;
+    if (moved) renderPins(); // marks dirty and pushes this new position out — without this, a manual ball drag never actually syncs to anyone else
   }
 
   // ---- Shot Menu: geometry + rendering ----
@@ -9420,7 +9423,18 @@
       if (deletedSet.has(rp.id)) return; // explicitly deleted — never resurrect, regardless of timestamp
       const lp = merged[rp.id];
       if (!lp) { merged[rp.id] = rp; return; } // only exists remotely — adopt it
-      if ((rp.updatedAt || 0) > (lp.updatedAt || 0)) merged[rp.id] = rp; // remote genuinely newer — take it
+      if ((rp.updatedAt || 0) > (lp.updatedAt || 0)) {
+        // A roll's floating badge is transient — it gets cleared the moment
+        // its pin's move is confirmed, which can easily happen before this
+        // merge ever arrives given the ~1.3-1.9s storage round trip. Surface
+        // it as a toast too, so a roll is never missed just because its
+        // badge came and went before this screen's sync caught up.
+        if (rp.diceResult && JSON.stringify(rp.diceResult) !== JSON.stringify(lp.diceResult)) {
+          const dr = rp.diceResult;
+          showToast(pinLabel(rp) + ' rolled ' + dr.label + ': ' + dr.total + ' (roll ' + dr.roll + ')', dr.boosted ? 'win' : undefined);
+        }
+        merged[rp.id] = rp; // remote genuinely newer — take it
+      }
     });
     return Object.values(merged);
   }
@@ -9680,22 +9694,51 @@
   let lastSavedSetupPayload = '';
 
   // Union-by-id merge for the setup collections (teams/saves/characters/
-  // savedTeams). This is the fix for the actual bug: saveSetupStateIfChanged
-  // used to just overwrite the shared setup key with whatever this device's
-  // own local array happened to be — so a person joining with an empty local
-  // library (nobody's device has anyone else's team stats in localStorage by
-  // default) could silently wipe out team stats someone else already
-  // created, the moment their own sync tick ran before they'd ever pulled
-  // the existing data in. Every id from either side survives; on a genuine
-  // same-id conflict this device's own copy wins, since that's the freshest
-  // thing it personally knows about — but nothing is ever dropped outright.
-  function mergeSetupCollection(localArr, remoteArr){
-    if (!Array.isArray(remoteArr)) return localArr;
-    if (!Array.isArray(localArr)) return remoteArr;
-    const byId = new Map();
-    remoteArr.forEach(item => byId.set(item.id, item));
-    localArr.forEach(item => byId.set(item.id, item)); // local wins on id conflict
-    return Array.from(byId.values());
+  // savedTeams). teamIdSeq/saveIdSeq/characterIdSeq/savedTeamIdSeq are all
+  // locally-generated, per-device sequential counters starting at 0 — they
+  // were never designed to be globally unique. That means two people who've
+  // each created even one team stat independently, on completely unrelated
+  // occasions, very plausibly both have an entry sitting at id 0. A simple
+  // "local wins on id conflict" merge would silently let one side's
+  // unrelated entry replace the other's, which is exactly how a real team
+  // stat someone created can vanish even though the merge itself succeeds.
+  // So instead: when two entries share an id but their actual content
+  // genuinely differs, that's treated as a coincidental collision between
+  // two different things, not an edit to the same thing — the local one
+  // gets a fresh id (using idSeqRef, which the caller bumps forward) so
+  // BOTH entries survive, rather than picking a winner and losing the other.
+  function mergeSetupCollection(localArr, remoteArr, idSeqRef){
+    if (!Array.isArray(remoteArr)) return { merged: localArr, renumbered: {} };
+    if (!Array.isArray(localArr)) return { merged: remoteArr, renumbered: {} };
+    const remoteById = new Map(remoteArr.map(item => [item.id, item]));
+    const result = remoteArr.slice();
+    const renumbered = {}; // oldId -> newId, for any pin references (npcTeamId) that need fixing up
+    localArr.forEach(item => {
+      const existingRemote = remoteById.get(item.id);
+      if (!existingRemote) { result.push(item); return; } // no conflict, just add
+      if (JSON.stringify(existingRemote) === JSON.stringify(item)) return; // identical — already included via remote
+      // Same id, different content — a coincidental collision, not the same
+      // entity. Give the local copy a fresh id so nothing gets lost.
+      const newId = idSeqRef.value++;
+      renumbered[item.id] = newId;
+      result.push({ ...item, id: newId });
+    });
+    return { merged: result, renumbered };
+  }
+
+  // Any local pin referencing a team id that just got renumbered needs its
+  // reference fixed up too, or it'll silently end up pointing at whatever
+  // unrelated team now sits at that old id instead.
+  function applyTeamRenumbering(renumbered){
+    if (!renumbered || Object.keys(renumbered).length === 0) return;
+    let changed = false;
+    pins.forEach(p => {
+      if (p.npcTeamId != null && renumbered[p.npcTeamId] !== undefined) {
+        p.npcTeamId = renumbered[p.npcTeamId];
+        changed = true;
+      }
+    });
+    if (changed) renderPins(); // marks dirty and pushes the corrected references out on the main live-state key
   }
 
   async function saveSetupStateIfChanged(){
@@ -9712,14 +9755,24 @@
         if (remoteResult && remoteResult.value) remote = JSON.parse(remoteResult.value);
       } catch (err) { /* nothing shared yet, or a transient read failure — proceed with local only */ }
       if (remote) {
-        teams = mergeSetupCollection(teams, remote.teams);
-        saves = mergeSetupCollection(saves, remote.saves);
-        characters = mergeSetupCollection(characters, remote.characters);
-        savedTeams = mergeSetupCollection(savedTeams, remote.savedTeams);
         teamIdSeq = Math.max(teamIdSeq, remote.teamIdSeq || 0);
         saveIdSeq = Math.max(saveIdSeq, remote.saveIdSeq || 0);
         characterIdSeq = Math.max(characterIdSeq, remote.characterIdSeq || 0);
         savedTeamIdSeq = Math.max(savedTeamIdSeq, remote.savedTeamIdSeq || 0);
+        const teamIdSeqRef = { value: teamIdSeq };
+        const saveIdSeqRef = { value: saveIdSeq };
+        const characterIdSeqRef = { value: characterIdSeq };
+        const savedTeamIdSeqRef = { value: savedTeamIdSeq };
+        const teamsResult = mergeSetupCollection(teams, remote.teams, teamIdSeqRef);
+        teams = teamsResult.merged;
+        applyTeamRenumbering(teamsResult.renumbered);
+        saves = mergeSetupCollection(saves, remote.saves, saveIdSeqRef).merged;
+        characters = mergeSetupCollection(characters, remote.characters, characterIdSeqRef).merged;
+        savedTeams = mergeSetupCollection(savedTeams, remote.savedTeams, savedTeamIdSeqRef).merged;
+        teamIdSeq = teamIdSeqRef.value;
+        saveIdSeq = saveIdSeqRef.value;
+        characterIdSeq = characterIdSeqRef.value;
+        savedTeamIdSeq = savedTeamIdSeqRef.value;
         renderTeams();
         refreshSavesDisplay();
         renderCharacterList();
@@ -9814,14 +9867,26 @@
       miscSettingsUpdatedAt = state.miscSettingsUpdatedAt;
       updateSyncedMiscSettingsHash();
     }
-    if (Array.isArray(state.teams)) teams = mergeSetupCollection(teams, state.teams);
     if (typeof state.teamIdSeq === 'number') teamIdSeq = Math.max(teamIdSeq, state.teamIdSeq);
-    if (Array.isArray(state.saves)) saves = mergeSetupCollection(saves, state.saves);
     if (typeof state.saveIdSeq === 'number') saveIdSeq = Math.max(saveIdSeq, state.saveIdSeq);
-    if (Array.isArray(state.characters)) characters = mergeSetupCollection(characters, state.characters);
     if (typeof state.characterIdSeq === 'number') characterIdSeq = Math.max(characterIdSeq, state.characterIdSeq);
-    if (Array.isArray(state.savedTeams)) savedTeams = mergeSetupCollection(savedTeams, state.savedTeams);
     if (typeof state.savedTeamIdSeq === 'number') savedTeamIdSeq = Math.max(savedTeamIdSeq, state.savedTeamIdSeq);
+    const teamIdSeqRef = { value: teamIdSeq };
+    const saveIdSeqRef = { value: saveIdSeq };
+    const characterIdSeqRef = { value: characterIdSeq };
+    const savedTeamIdSeqRef = { value: savedTeamIdSeq };
+    if (Array.isArray(state.teams)) {
+      const teamsResult = mergeSetupCollection(teams, state.teams, teamIdSeqRef);
+      teams = teamsResult.merged;
+      applyTeamRenumbering(teamsResult.renumbered);
+    }
+    if (Array.isArray(state.saves)) saves = mergeSetupCollection(saves, state.saves, saveIdSeqRef).merged;
+    if (Array.isArray(state.characters)) characters = mergeSetupCollection(characters, state.characters, characterIdSeqRef).merged;
+    if (Array.isArray(state.savedTeams)) savedTeams = mergeSetupCollection(savedTeams, state.savedTeams, savedTeamIdSeqRef).merged;
+    teamIdSeq = teamIdSeqRef.value;
+    saveIdSeq = saveIdSeqRef.value;
+    characterIdSeq = characterIdSeqRef.value;
+    savedTeamIdSeq = savedTeamIdSeqRef.value;
     if (Array.isArray(state.teams) || Array.isArray(state.saves) || Array.isArray(state.characters) || Array.isArray(state.savedTeams)) {
       persistTeamsAndRostersLocally();
       renderTeams();
@@ -9905,57 +9970,71 @@
   // in anyone else's newer save — but only when it's safe (not mid-drag/mid-menu),
   // so an incoming update never yanks something out from under you.
   let tickCount = 0;
+  // setInterval fires a new syncTick every 250ms regardless of whether the
+  // previous call finished — and a single storage read/write can take
+  // 1.3-1.9s on its own, so without this guard many overlapping syncTick
+  // calls end up running at once, all competing for the same storage
+  // service at the same time. That's almost certainly why some writes (a
+  // presence heartbeat, a manual ball drag) were going missing or getting
+  // silently starved even though each one's own code was correct in isolation.
+  let syncTickInFlight = false;
   async function syncTick(){
-    tickCount += 1;
-    if (!window.storage) return;
-    let justSaved = false;
-    if (localDirty && Date.now() >= saveCooldownUntil) {
-      justSaved = !!(await saveState({ silent: true }));
-    }
-    saveSetupStateIfChanged(); // no-op unless teams/saves/rosters actually changed since last time
-
-    if (conferenceRoom) {
-      if (tickCount % 5 === 0) writePresenceHeartbeat();
-      else if (tickCount % 5 === 2) fetchPresence();
-    }
-
-    if (dragState || ballDragState || aimingType || challengeState || subState) return;
-    if (anyPanelOpen()) return;
-
-    // Skip this poll if we just saved — the save's own merge step already
-    // fetched the freshest remote data a moment ago, so re-fetching it again
-    // right now would just be a second slow round-trip confirming the same
-    // thing we already know. This is the single biggest source of the extra
-    // delay: each storage read/write takes ~1.3-1.9s on its own (confirmed by
-    // the Storage Test), so cutting one redundant call per tick meaningfully
-    // shortens how long a full sync cycle actually takes to finish.
-    if (!justSaved) {
-      try {
-        const result = await window.storage.get(STORAGE_KEY, !!conferenceRoom);
-        if (!result || !result.value) return;
-        const state = JSON.parse(result.value);
-        const remoteVersion = typeof state.version === 'number' ? state.version : 0;
-        if (remoteVersion > localVersion) {
-          localVersion = remoteVersion;
-          applyLoadedState(state);
-        }
-      } catch (err) {
-        // quietly ignore — we'll just try again on the next tick
+    if (syncTickInFlight) return;
+    syncTickInFlight = true;
+    try {
+      tickCount += 1;
+      if (!window.storage) return;
+      let justSaved = false;
+      if (localDirty && Date.now() >= saveCooldownUntil) {
+        justSaved = !!(await saveState({ silent: true }));
       }
-    }
+      await saveSetupStateIfChanged(); // no-op unless teams/saves/rosters actually changed since last time
 
-    // Setup data changes rarely, so it's only worth polling occasionally rather
-    // than every tick — reduces extra network calls for a key that's mostly static.
-    if (tickCount % 3 === 1) {
-      try {
-        const setupResult = await window.storage.get(setupKey(), !!conferenceRoom);
-        if (setupResult && setupResult.value && setupResult.value !== lastSavedSetupPayload) {
-          applyLoadedState(JSON.parse(setupResult.value));
-          lastSavedSetupPayload = setupResult.value;
-        }
-      } catch (err) {
-        // quietly ignore — we'll just try again in a few ticks
+      if (conferenceRoom) {
+        if (tickCount % 5 === 0) await writePresenceHeartbeat();
+        else if (tickCount % 5 === 2) await fetchPresence();
       }
+
+      if (dragState || ballDragState || aimingType || challengeState || subState) return;
+      if (anyPanelOpen()) return;
+
+      // Skip this poll if we just saved — the save's own merge step already
+      // fetched the freshest remote data a moment ago, so re-fetching it again
+      // right now would just be a second slow round-trip confirming the same
+      // thing we already know. This is the single biggest source of the extra
+      // delay: each storage read/write takes ~1.3-1.9s on its own (confirmed by
+      // the Storage Test), so cutting one redundant call per tick meaningfully
+      // shortens how long a full sync cycle actually takes to finish.
+      if (!justSaved) {
+        try {
+          const result = await window.storage.get(STORAGE_KEY, !!conferenceRoom);
+          if (!result || !result.value) return;
+          const state = JSON.parse(result.value);
+          const remoteVersion = typeof state.version === 'number' ? state.version : 0;
+          if (remoteVersion > localVersion) {
+            localVersion = remoteVersion;
+            applyLoadedState(state);
+          }
+        } catch (err) {
+          // quietly ignore — we'll just try again on the next tick
+        }
+      }
+
+      // Setup data changes rarely, so it's only worth polling occasionally rather
+      // than every tick — reduces extra network calls for a key that's mostly static.
+      if (tickCount % 3 === 1) {
+        try {
+          const setupResult = await window.storage.get(setupKey(), !!conferenceRoom);
+          if (setupResult && setupResult.value && setupResult.value !== lastSavedSetupPayload) {
+            applyLoadedState(JSON.parse(setupResult.value));
+            lastSavedSetupPayload = setupResult.value;
+          }
+        } catch (err) {
+          // quietly ignore — we'll just try again in a few ticks
+        }
+      }
+    } finally {
+      syncTickInFlight = false;
     }
   }
 
