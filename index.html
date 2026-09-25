@@ -3238,7 +3238,7 @@
 
   function logEvent(text){
     const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    activityLog.push({ time, text });
+    activityLog.push({ time, text, seq: nextTimestamp() });
     if (activityLog.length > 300) activityLog.shift();
     renderActivityLog();
     markDirty();
@@ -3260,7 +3260,7 @@
     const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     const label = pinRollLabel(pin);
     const total = roll + buff;
-    diceRollLog.push({ time, label, roll, buff, total });
+    diceRollLog.push({ time, label, roll, buff, total, seq: nextTimestamp() });
     if (diceRollLog.length > 300) diceRollLog.shift();
     renderDiceRollLog();
     markDirty();
@@ -6615,6 +6615,48 @@
     lastSyncedPendingEmergencyStopperHash = JSON.stringify(pendingEmergencyStopperOffer);
   }
 
+  // The same protection extended to the fields that were still blind
+  // overwrites: score (the actual match result — the highest-stakes one
+  // here), which chunk is currently being viewed, the live match
+  // simulation's state, and a bundle of low-frequency setup fields
+  // (team names, stadium look, grey zone color) that don't need individual
+  // granularity from each other but do need to stay separate from score
+  // specifically, so an unrelated cosmetic change can never accidentally
+  // revert a goal that just got scored.
+  let scoreUpdatedAt = 0, lastSyncedScoreHash = null;
+  let chunkValueUpdatedAt = 0, lastSyncedChunkValueHash = null;
+  let matchSimUpdatedAt = 0, lastSyncedMatchSimHash = null;
+  let miscSettingsUpdatedAt = 0, lastSyncedMiscSettingsHash = null;
+
+  function stampScoreIfChanged(){
+    const hash = JSON.stringify([scoreA.value, scoreB.value]);
+    if (hash !== lastSyncedScoreHash) scoreUpdatedAt = nextTimestamp();
+  }
+  function updateSyncedScoreHash(){
+    lastSyncedScoreHash = JSON.stringify([scoreA.value, scoreB.value]);
+  }
+  function stampChunkValueIfChanged(){
+    const hash = chunkValue.value;
+    if (hash !== lastSyncedChunkValueHash) chunkValueUpdatedAt = nextTimestamp();
+  }
+  function updateSyncedChunkValueHash(){
+    lastSyncedChunkValueHash = chunkValue.value;
+  }
+  function stampMatchSimIfChanged(){
+    const hash = JSON.stringify(matchSim);
+    if (hash !== lastSyncedMatchSimHash) matchSimUpdatedAt = nextTimestamp();
+  }
+  function updateSyncedMatchSimHash(){
+    lastSyncedMatchSimHash = JSON.stringify(matchSim);
+  }
+  function stampMiscSettingsIfChanged(){
+    const hash = JSON.stringify([teamAName.value, teamBName.value, stadiumLook, document.getElementById('greyZoneColor').value]);
+    if (hash !== lastSyncedMiscSettingsHash) miscSettingsUpdatedAt = nextTimestamp();
+  }
+  function updateSyncedMiscSettingsHash(){
+    lastSyncedMiscSettingsHash = JSON.stringify([teamAName.value, teamBName.value, stadiumLook, document.getElementById('greyZoneColor').value]);
+  }
+
   function resolveDribbleOutcome(choice){
     if (!pendingDribbleOutcome) return;
     const { defenderId, dribblerId } = pendingDribbleOutcome;
@@ -9406,6 +9448,20 @@
     return Object.values(merged);
   }
 
+  // Append-only logs (activity log, dice roll log) need a genuine merge, not
+  // a last-write-wins overwrite — otherwise two people each logging
+  // something around the same time means one of them silently loses their
+  // entries the moment the other's save happens to win the race. Combines
+  // both sides, dedupes by each entry's unique logical-clock sequence
+  // number, sorts chronologically, and re-applies the same length cap.
+  function mergeLogs(localLog, remoteLog, cap){
+    const byId = new Map();
+    localLog.forEach(e => byId.set(e.seq, e));
+    remoteLog.forEach(e => { if (!byId.has(e.seq)) byId.set(e.seq, e); });
+    const merged = Array.from(byId.values()).sort((a, b) => (a.seq || 0) - (b.seq || 0));
+    return cap ? merged.slice(-cap) : merged;
+  }
+
   // Merges maxChunkReached the same way pins are merged — but since this value
   // should normally only ever climb, the default rule is "take the higher one"
   // (protects against a sync race accidentally dragging it backward). The one
@@ -9458,6 +9514,10 @@
         noteObservedTimestamp(remoteState.pendingChallengeResponseUpdatedAt);
         noteObservedTimestamp(remoteState.pendingDribbleOutcomeUpdatedAt);
         noteObservedTimestamp(remoteState.pendingEmergencyStopperOfferUpdatedAt);
+        noteObservedTimestamp(remoteState.scoreUpdatedAt);
+        noteObservedTimestamp(remoteState.chunkValueUpdatedAt);
+        noteObservedTimestamp(remoteState.matchSimUpdatedAt);
+        noteObservedTimestamp(remoteState.miscSettingsUpdatedAt);
       }
       stampChangedPins(); // fresh timestamp on anything that actually changed locally
       stampBallIfChanged();
@@ -9465,6 +9525,10 @@
       stampPendingChallengeIfChanged();
       stampPendingDribbleIfChanged();
       stampPendingEmergencyStopperIfChanged();
+      stampScoreIfChanged();
+      stampChunkValueIfChanged();
+      stampMatchSimIfChanged();
+      stampMiscSettingsIfChanged();
 
       if (remoteState) {
         if (Array.isArray(remoteState.pins)) {
@@ -9488,6 +9552,51 @@
           pendingEmergencyStopperOffer = remoteState.pendingEmergencyStopperOffer || null;
           pendingEmergencyStopperOfferUpdatedAt = remoteState.pendingEmergencyStopperOfferUpdatedAt;
         }
+        if (Array.isArray(remoteState.activityLog)) {
+          activityLog = mergeLogs(activityLog, remoteState.activityLog, 300);
+        }
+        if (Array.isArray(remoteState.diceRollLog)) {
+          diceRollLog = mergeLogs(diceRollLog, remoteState.diceRollLog, 300);
+        }
+        if ((remoteState.scoreUpdatedAt || 0) > scoreUpdatedAt && remoteState.scoreA !== undefined && remoteState.scoreB !== undefined) {
+          scoreA.value = remoteState.scoreA;
+          scoreB.value = remoteState.scoreB;
+          scoreUpdatedAt = remoteState.scoreUpdatedAt;
+        }
+        if ((remoteState.chunkValueUpdatedAt || 0) > chunkValueUpdatedAt && remoteState.chunkValue !== undefined) {
+          chunkValue.value = remoteState.chunkValue;
+          chunkValueUpdatedAt = remoteState.chunkValueUpdatedAt;
+        }
+        if ((remoteState.matchSimUpdatedAt || 0) > matchSimUpdatedAt && 'matchSim' in remoteState) {
+          matchSim = remoteState.matchSim;
+          matchSimUpdatedAt = remoteState.matchSimUpdatedAt;
+        }
+        if ((remoteState.miscSettingsUpdatedAt || 0) > miscSettingsUpdatedAt) {
+          if (remoteState.teamAName !== undefined) teamAName.value = remoteState.teamAName;
+          if (remoteState.teamBName !== undefined) teamBName.value = remoteState.teamBName;
+          if (remoteState.stadiumLook === 'basic' || remoteState.stadiumLook === 'caged' || remoteState.stadiumLook === 'crowd') {
+            stadiumLook = remoteState.stadiumLook;
+            refreshStadiumLookBtns();
+          }
+          if (remoteState.greyZoneColor) {
+            document.getElementById('greyZoneColor').value = remoteState.greyZoneColor;
+            document.getElementById('greyZone').setAttribute('fill', remoteState.greyZoneColor);
+          }
+          miscSettingsUpdatedAt = remoteState.miscSettingsUpdatedAt;
+        }
+        // Pure counters — always safe to just take whichever is higher,
+        // regardless of timestamps, since a lower value is never correct
+        // once a higher one has been seen anywhere.
+        if (typeof remoteState.idSeq === 'number') idSeq = Math.max(idSeq, remoteState.idSeq);
+        if (typeof remoteState.spawnIndex === 'number') spawnIndex = Math.max(spawnIndex, remoteState.spawnIndex);
+        if (typeof remoteState.shotIdSeq === 'number') shotIdSeq = Math.max(shotIdSeq, remoteState.shotIdSeq);
+        // chunkSnapshots is naturally a collection (keyed by chunk number) —
+        // union both sides' entries rather than one overwriting the other,
+        // so two people snapshotting different chunks around the same time
+        // don't cost each other their history.
+        if (remoteState.chunkSnapshots) {
+          chunkSnapshots = { ...remoteState.chunkSnapshots, ...chunkSnapshots };
+        }
         mergeMaxChunk(remoteState.maxChunkReached, remoteState.maxChunkResetAt);
       }
 
@@ -9502,11 +9611,12 @@
         ball, shots, shotIdSeq, deletedShotIds,
         hasStartedPlay, maxChunkReached, maxChunkResetAt, stadiumLook,
         chunkSnapshots,
-        chunkValue: chunkValue.value,
-        scoreA: scoreA.value, scoreB: scoreB.value,
+        chunkValue: chunkValue.value, chunkValueUpdatedAt,
+        scoreA: scoreA.value, scoreB: scoreB.value, scoreUpdatedAt,
         teamAName: teamAName.value, teamBName: teamBName.value,
         greyZoneColor: document.getElementById('greyZoneColor').value,
-        matchSim,
+        miscSettingsUpdatedAt,
+        matchSim, matchSimUpdatedAt,
         activityLog,
         diceRollLog,
         pendingChallengeResponse, pendingChallengeResponseUpdatedAt,
@@ -9538,6 +9648,10 @@
       updateSyncedPendingChallengeHash();
       updateSyncedPendingDribbleHash();
       updateSyncedPendingEmergencyStopperHash();
+      updateSyncedScoreHash();
+      updateSyncedChunkValueHash();
+      updateSyncedMatchSimHash();
+      updateSyncedMiscSettingsHash();
       applyingRemote = true; // the merge may have pulled in pins we didn't have — reflect that without re-flagging dirty
       renderPins();
       applyingRemote = false;
@@ -9565,10 +9679,56 @@
   function setupKey(){ return STORAGE_KEY + '_setup'; }
   let lastSavedSetupPayload = '';
 
+  // Union-by-id merge for the setup collections (teams/saves/characters/
+  // savedTeams). This is the fix for the actual bug: saveSetupStateIfChanged
+  // used to just overwrite the shared setup key with whatever this device's
+  // own local array happened to be — so a person joining with an empty local
+  // library (nobody's device has anyone else's team stats in localStorage by
+  // default) could silently wipe out team stats someone else already
+  // created, the moment their own sync tick ran before they'd ever pulled
+  // the existing data in. Every id from either side survives; on a genuine
+  // same-id conflict this device's own copy wins, since that's the freshest
+  // thing it personally knows about — but nothing is ever dropped outright.
+  function mergeSetupCollection(localArr, remoteArr){
+    if (!Array.isArray(remoteArr)) return localArr;
+    if (!Array.isArray(localArr)) return remoteArr;
+    const byId = new Map();
+    remoteArr.forEach(item => byId.set(item.id, item));
+    localArr.forEach(item => byId.set(item.id, item)); // local wins on id conflict
+    return Array.from(byId.values());
+  }
+
   async function saveSetupStateIfChanged(){
     if (!window.storage) return;
     let payload = JSON.stringify({ teams, teamIdSeq, saves, saveIdSeq, characters, characterIdSeq, savedTeams, savedTeamIdSeq });
     if (payload === lastSavedSetupPayload) return; // nothing setup-related changed — this is the whole point of splitting it out
+    try {
+      // Fetch whatever's currently shared FIRST and merge into it, rather
+      // than overwriting outright — this is what actually prevents a fresh
+      // or stale local copy from clobbering data someone else already saved.
+      let remote = null;
+      try {
+        const remoteResult = await window.storage.get(setupKey(), !!conferenceRoom);
+        if (remoteResult && remoteResult.value) remote = JSON.parse(remoteResult.value);
+      } catch (err) { /* nothing shared yet, or a transient read failure — proceed with local only */ }
+      if (remote) {
+        teams = mergeSetupCollection(teams, remote.teams);
+        saves = mergeSetupCollection(saves, remote.saves);
+        characters = mergeSetupCollection(characters, remote.characters);
+        savedTeams = mergeSetupCollection(savedTeams, remote.savedTeams);
+        teamIdSeq = Math.max(teamIdSeq, remote.teamIdSeq || 0);
+        saveIdSeq = Math.max(saveIdSeq, remote.saveIdSeq || 0);
+        characterIdSeq = Math.max(characterIdSeq, remote.characterIdSeq || 0);
+        savedTeamIdSeq = Math.max(savedTeamIdSeq, remote.savedTeamIdSeq || 0);
+        renderTeams();
+        refreshSavesDisplay();
+        renderCharacterList();
+        refreshLoadCharacterDropdown();
+        payload = JSON.stringify({ teams, teamIdSeq, saves, saveIdSeq, characters, characterIdSeq, savedTeams, savedTeamIdSeq });
+      }
+    } catch (err) {
+      console.error('Setup data merge failed:', err);
+    }
     if (payload.length > 4_800_000) {
       // too close to the 5MB per-key limit — trim the oldest saved sheets rather than fail outright
       while (saves.length > 1 && JSON.stringify({ teams, teamIdSeq, saves, saveIdSeq, characters, characterIdSeq, savedTeams, savedTeamIdSeq }).length > 4_800_000) {
@@ -9606,8 +9766,10 @@
       pins = mergePins(pins, state.pins.map(normalizePin), state.deletedPinIds);
       updateSyncedPinHashes();
     }
-    if (typeof state.idSeq === 'number') idSeq = state.idSeq;
-    if (typeof state.spawnIndex === 'number') spawnIndex = state.spawnIndex;
+    // Pure counters — always safe to take whichever is higher, never a
+    // stale lower value regardless of timing.
+    if (typeof state.idSeq === 'number') idSeq = Math.max(idSeq, state.idSeq);
+    if (typeof state.spawnIndex === 'number') spawnIndex = Math.max(spawnIndex, state.spawnIndex);
     if (state.ball) {
       noteObservedTimestamp(state.ball.updatedAt);
       if ((state.ball.updatedAt || 0) > (ball.updatedAt || 0)) ball = state.ball;
@@ -9618,35 +9780,64 @@
       shots = mergeShots(shots, state.shots, state.deletedShotIds);
       updateSyncedShotHashes();
     }
-    if (typeof state.shotIdSeq === 'number') shotIdSeq = state.shotIdSeq;
+    if (typeof state.shotIdSeq === 'number') shotIdSeq = Math.max(shotIdSeq, state.shotIdSeq);
     if (typeof state.hasStartedPlay === 'boolean') hasStartedPlay = state.hasStartedPlay;
-    if (state.stadiumLook === 'basic' || state.stadiumLook === 'caged' || state.stadiumLook === 'crowd') {
-      stadiumLook = state.stadiumLook;
-      refreshStadiumLookBtns();
-    }
     mergeMaxChunk(state.maxChunkReached, state.maxChunkResetAt);
-    if (state.chunkSnapshots) chunkSnapshots = state.chunkSnapshots;
-    if (state.chunkValue !== undefined) chunkValue.value = state.chunkValue;
-    if (state.scoreA !== undefined) scoreA.value = state.scoreA;
-    if (state.scoreB !== undefined) scoreB.value = state.scoreB;
-    if (state.teamAName !== undefined) teamAName.value = state.teamAName;
-    if (state.teamBName !== undefined) teamBName.value = state.teamBName;
-    if (state.greyZoneColor) {
-      document.getElementById('greyZoneColor').value = state.greyZoneColor;
-      document.getElementById('greyZone').setAttribute('fill', state.greyZoneColor);
+    // chunkSnapshots is a collection keyed by chunk number — union both
+    // sides rather than letting one wholesale overwrite the other.
+    if (state.chunkSnapshots) chunkSnapshots = { ...state.chunkSnapshots, ...chunkSnapshots };
+    noteObservedTimestamp(state.chunkValueUpdatedAt);
+    if ((state.chunkValueUpdatedAt || 0) > chunkValueUpdatedAt && state.chunkValue !== undefined) {
+      chunkValue.value = state.chunkValue;
+      chunkValueUpdatedAt = state.chunkValueUpdatedAt;
+      updateSyncedChunkValueHash();
     }
-    if (Array.isArray(state.teams)) teams = state.teams;
-    if (typeof state.teamIdSeq === 'number') teamIdSeq = state.teamIdSeq;
-    if (Array.isArray(state.saves)) saves = state.saves;
-    if (typeof state.saveIdSeq === 'number') saveIdSeq = state.saveIdSeq;
-    if (Array.isArray(state.characters)) characters = state.characters;
-    if (typeof state.characterIdSeq === 'number') characterIdSeq = state.characterIdSeq;
-    if (Array.isArray(state.savedTeams)) savedTeams = state.savedTeams;
-    if (typeof state.savedTeamIdSeq === 'number') savedTeamIdSeq = state.savedTeamIdSeq;
-    if (Array.isArray(state.teams) || Array.isArray(state.saves) || Array.isArray(state.characters) || Array.isArray(state.savedTeams)) persistTeamsAndRostersLocally();
-    if ('matchSim' in state) { matchSim = state.matchSim; renderMatchSim(); }
-    if (Array.isArray(state.activityLog)) activityLog = state.activityLog;
-    if (Array.isArray(state.diceRollLog)) { diceRollLog = state.diceRollLog; renderDiceRollLog(); }
+    noteObservedTimestamp(state.scoreUpdatedAt);
+    if ((state.scoreUpdatedAt || 0) > scoreUpdatedAt && state.scoreA !== undefined && state.scoreB !== undefined) {
+      scoreA.value = state.scoreA;
+      scoreB.value = state.scoreB;
+      scoreUpdatedAt = state.scoreUpdatedAt;
+      updateSyncedScoreHash();
+    }
+    noteObservedTimestamp(state.miscSettingsUpdatedAt);
+    if ((state.miscSettingsUpdatedAt || 0) > miscSettingsUpdatedAt) {
+      if (state.teamAName !== undefined) teamAName.value = state.teamAName;
+      if (state.teamBName !== undefined) teamBName.value = state.teamBName;
+      if (state.stadiumLook === 'basic' || state.stadiumLook === 'caged' || state.stadiumLook === 'crowd') {
+        stadiumLook = state.stadiumLook;
+        refreshStadiumLookBtns();
+      }
+      if (state.greyZoneColor) {
+        document.getElementById('greyZoneColor').value = state.greyZoneColor;
+        document.getElementById('greyZone').setAttribute('fill', state.greyZoneColor);
+      }
+      miscSettingsUpdatedAt = state.miscSettingsUpdatedAt;
+      updateSyncedMiscSettingsHash();
+    }
+    if (Array.isArray(state.teams)) teams = mergeSetupCollection(teams, state.teams);
+    if (typeof state.teamIdSeq === 'number') teamIdSeq = Math.max(teamIdSeq, state.teamIdSeq);
+    if (Array.isArray(state.saves)) saves = mergeSetupCollection(saves, state.saves);
+    if (typeof state.saveIdSeq === 'number') saveIdSeq = Math.max(saveIdSeq, state.saveIdSeq);
+    if (Array.isArray(state.characters)) characters = mergeSetupCollection(characters, state.characters);
+    if (typeof state.characterIdSeq === 'number') characterIdSeq = Math.max(characterIdSeq, state.characterIdSeq);
+    if (Array.isArray(state.savedTeams)) savedTeams = mergeSetupCollection(savedTeams, state.savedTeams);
+    if (typeof state.savedTeamIdSeq === 'number') savedTeamIdSeq = Math.max(savedTeamIdSeq, state.savedTeamIdSeq);
+    if (Array.isArray(state.teams) || Array.isArray(state.saves) || Array.isArray(state.characters) || Array.isArray(state.savedTeams)) {
+      persistTeamsAndRostersLocally();
+      renderTeams();
+      refreshSavesDisplay();
+      renderCharacterList();
+      refreshLoadCharacterDropdown();
+    }
+    noteObservedTimestamp(state.matchSimUpdatedAt);
+    if ('matchSim' in state && (state.matchSimUpdatedAt || 0) > matchSimUpdatedAt) {
+      matchSim = state.matchSim;
+      matchSimUpdatedAt = state.matchSimUpdatedAt || 0;
+      updateSyncedMatchSimHash();
+      renderMatchSim();
+    }
+    if (Array.isArray(state.activityLog)) activityLog = mergeLogs(activityLog, state.activityLog, 300);
+    if (Array.isArray(state.diceRollLog)) { diceRollLog = mergeLogs(diceRollLog, state.diceRollLog, 300); renderDiceRollLog(); }
     if (('pendingChallengeResponseUpdatedAt' in state) && (state.pendingChallengeResponseUpdatedAt || 0) > pendingChallengeResponseUpdatedAt) {
       pendingChallengeResponse = state.pendingChallengeResponse || null;
       pendingChallengeResponseUpdatedAt = state.pendingChallengeResponseUpdatedAt || 0;
