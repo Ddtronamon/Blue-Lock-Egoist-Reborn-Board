@@ -2128,6 +2128,7 @@
 
     <button class="btn danger" id="endMatchBtn" type="button" title="Resets every pin's Dash, Talent, and Flow charges/cooldowns back to full">End Match</button>
     <button class="btn" id="simulateMatchBtn" type="button" title="Instantly resolves a full match using team stats, then animates the key moments so you can watch it play out">Simulate Match</button>
+    <button class="btn" id="gkReactBtn" type="button" title="Automatically resolves the nearest goalkeeper's reaction if the ball is currently in their six-yard box">GK Reacts</button>
   </div>
 
   <div class="stage-wrap">
@@ -3312,6 +3313,33 @@
   // If a future task appears to require touching this, STOP and
   // ask the user to explicitly confirm before changing anything here.
   // ============================================================
+  // ---- GK auto-reaction: ball-in-box detection and finding the right keeper ----
+  const GOAL_WIDTH_PCT = 13.71; // matches .goal-3d-left/.goal-3d-right's height — same units as pin.y/ball.y
+
+  function isBallInGoalBox(){
+    if (!ball.active) return null;
+    const fx = (ball.x / 100) * 1240;
+    const fy = (ball.y / 100) * 700;
+    const inSixYardY = fy >= 258 && fy <= 442; // the smaller six-yard box, not the full 18-yard penalty box
+    if (fx <= 122 && inSixYardY) return 'left';
+    if (fx >= 1118 && inSixYardY) return 'right';
+    return null;
+  }
+
+  // Whichever on-field, non-benched, non-banned Goalkeeper is physically
+  // closest to that goal is assumed to be the one defending it — avoids
+  // needing an explicit "which team defends which side" configuration.
+  function findGkForSide(side){
+    const goalX = side === 'left' ? 0 : 100;
+    const candidates = pins.filter(p => p.npcPosition === 'Goalkeepers' && !p.onBench && !p.banned);
+    if (!candidates.length) return null;
+    return candidates.reduce((closest, p) => {
+      const dist = Math.abs(p.x - goalX);
+      const closestDist = Math.abs(closest.x - goalX);
+      return dist < closestDist ? p : closest;
+    });
+  }
+
   function getShotZone(pin){
     const fx = (pin.x / 100) * 1240;
     const fy = (pin.y / 100) * 700;
@@ -4387,7 +4415,6 @@
 
   function onBallPointerUp(e){
     if (!ballDragState || e.pointerId !== ballDragState.pointerId) return;
-    let moved = false;
     if (ballDragState.lastX !== undefined) {
       ball.x = ballDragState.lastX;
       ball.y = ballDragState.lastY;
@@ -4397,14 +4424,12 @@
         ball.offsetX = ball.x - carrier.x;
         ball.offsetY = ball.y - carrier.y;
       }
-      moved = true;
     }
     ballDragState.el.classList.remove('dragging');
     ballDragState.el.removeEventListener('pointermove', onBallPointerMove);
     ballDragState.el.removeEventListener('pointerup', onBallPointerUp);
     ballDragState.el.removeEventListener('pointercancel', onBallPointerUp);
     ballDragState = null;
-    if (moved) renderPins(); // marks dirty and pushes this new position out — without this, a manual ball drag never actually syncs to anyone else
   }
 
   // ---- Shot Menu: geometry + rendering ----
@@ -5219,6 +5244,100 @@
     closeBallPanel();
     renderPins();
   });
+
+  // One roll for a GK reaction step — D20 + stat + talents, same convention
+  // as every other roll in the app (11+ succeeds), logged to the dice log
+  // immediately so the full sequence is visible even though only the final,
+  // decisive roll ends up shown as this pin's floating badge.
+  function gkRoll(pin, statKey){
+    const roll = Math.floor(Math.random() * 20) + 1;
+    const buff = getPinStat(pin, statKey) + applyTalentBuff(pin, statKey);
+    const total = roll + buff;
+    logDiceRoll(pin, roll, buff);
+    return { roll, buff, total, success: total >= 11 };
+  }
+
+  // The full automated GK decision tree:
+  // near the ball (within goal width) -> STR catch attempt.
+  // far -> MTL to read it and skip the dive, or AGL to dive for it (fail = goal),
+  //        then ACC to actually clear it once in position.
+  // Any non-catch, non-goal failure just leaves the ball loose near the goal —
+  // left for the GM to narrate from there, same as a normal shot's outcome.
+  function resolveGkReaction(){
+    const side = isBallInGoalBox();
+    if (!side) {
+      showToast('The ball isn\u2019t in a six-yard box right now.', 'error');
+      return;
+    }
+    const gk = findGkForSide(side);
+    if (!gk) {
+      showToast('No Goalkeeper found on the field for that side.', 'error');
+      return;
+    }
+
+    function placeLooseBallNearGoal(){
+      ball.x = side === 'left' ? 8 : 92;
+      ball.y = Math.max(5, Math.min(95, ball.y + (Math.random() * 10 - 5)));
+      ball.offsetX = 0; ball.offsetY = 0;
+      pins.forEach(p => { p.ballCarrier = false; });
+    }
+
+    const near = Math.abs(gk.y - ball.y) <= GOAL_WIDTH_PCT;
+
+    if (near) {
+      const str = gkRoll(gk, 'STR');
+      gk.diceResult = { label: 'GK (Catch) STR', roll: str.roll, buff: str.buff, total: str.total, boosted: str.success };
+      if (str.success) {
+        pins.forEach(p => { p.ballCarrier = false; });
+        gk.ballCarrier = true;
+        ball.x = gk.x; ball.y = gk.y; ball.offsetX = 0; ball.offsetY = 0;
+        logEvent(pinLabel(gk) + ' snatches it clean! (STR ' + str.total + ')');
+        showToast(pinLabel(gk) + ' SNATCHES the ball!', 'win');
+      } else {
+        placeLooseBallNearGoal();
+        logEvent(pinLabel(gk) + ' can\u2019t hold on \u2014 ball loose near goal. (STR ' + str.total + ')');
+        showToast(pinLabel(gk) + ' fumbles it \u2014 loose ball!', 'error');
+      }
+    } else {
+      const mtl = gkRoll(gk, 'MTL');
+      gk.diceResult = { label: 'GK (Read) MTL', roll: mtl.roll, buff: mtl.buff, total: mtl.total, boosted: mtl.success };
+
+      if (!mtl.success) {
+        const agl = gkRoll(gk, 'AGL');
+        logEvent(pinLabel(gk) + ' has to dive \u2014 AGL ' + agl.total + (agl.success ? ' \u2014 gets there!' : ' \u2014 comes up short.'));
+        if (!agl.success) {
+          gk.diceResult = { label: 'GK (Dive) AGL', roll: agl.roll, buff: agl.buff, total: agl.total, boosted: false };
+          showToast('GOAL! ' + pinLabel(gk) + ' couldn\u2019t reach it in time.', 'error');
+          markDirty();
+          renderPins();
+          return; // no ACC attempt at all — the dive failed completely
+        }
+        gk.diceResult = { label: 'GK (Dive) AGL', roll: agl.roll, buff: agl.buff, total: agl.total, boosted: true };
+      } else {
+        logEvent(pinLabel(gk) + ' reads it perfectly \u2014 already in position. (MTL ' + mtl.total + ')');
+      }
+
+      const acc = gkRoll(gk, 'ACC');
+      gk.diceResult = { label: 'GK (Clear) ACC', roll: acc.roll, buff: acc.buff, total: acc.total, boosted: acc.success };
+      if (acc.success) {
+        ball.x = side === 'left' ? 35 : 65;
+        ball.y = Math.max(10, Math.min(90, 50 + (Math.random() * 30 - 15)));
+        ball.offsetX = 0; ball.offsetY = 0;
+        pins.forEach(p => { p.ballCarrier = false; });
+        logEvent(pinLabel(gk) + ' hits it away! (ACC ' + acc.total + ')');
+        showToast(pinLabel(gk) + ' HITS IT AWAY!', 'win');
+      } else {
+        placeLooseBallNearGoal();
+        logEvent(pinLabel(gk) + ' gets a hand to it but can\u2019t clear it \u2014 loose ball near goal. (ACC ' + acc.total + ')');
+        showToast(pinLabel(gk) + ' can\u2019t clear it \u2014 loose ball!', 'error');
+      }
+    }
+
+    markDirty();
+    renderPins();
+  }
+
+  document.getElementById('gkReactBtn').addEventListener('click', resolveGkReaction);
 
   // ---- Play-mode context menu (Stats + Ball Carry) ----
   const STAT_KEYS = ['ACC', 'AGL', 'STR', 'SPD', 'MTL'];
